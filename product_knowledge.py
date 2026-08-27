@@ -1,15 +1,16 @@
 """Reddit-backed product knowledge for the "Talk to your product" feature.
 
-Pipeline (all free / local except nothing — no LLM is involved here):
+Pipeline:
     1. Scrape: top 30 Reddit posts about the product via Reddit's public JSON API.
     2. Chunk:  rule-based — one chunk per post body + one per top comment (5/post).
-    3. Store:  ChromaDB in-memory collection; its default embedding function runs
-               all-MiniLM-L6-v2 locally on CPU (downloads ~80 MB once, then offline).
-    4. Retrieve: embed the user's question, return the most relevant chunks.
+    3. Store:  embed each chunk with Gemini gemini-embedding-001 (768-dim) and store the
+               vectors in Postgres via pgvector (models.Chunk), scoped by product_slug.
+    4. Retrieve: embed the user's question and cosine-search the product's chunks.
 
-Reuse over re-scrape: before scraping, we check whether this product's collection is
-already in the (persistent) vector DB and still fresh (within CACHE_TTL_DAYS). If so we
-reuse it and spend zero RapidAPI requests; only missing or stale products are scraped.
+Reuse over re-scrape: before scraping, we check whether this product's chunks are already
+in the DB and still fresh (within CACHE_TTL_DAYS). If so we reuse them and spend zero
+RapidAPI requests; only missing or stale products are scraped. DB access needs a Flask app
+context (request handlers and Celery tasks already have one).
 Run standalone to test:  python product_knowledge.py "Samsung Galaxy S26 Ultra"
 """
 
@@ -22,8 +23,11 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-import chromadb
 from dotenv import load_dotenv
+from sqlalchemy import func
+
+from models import db, Chunk
+from gemini_service import embed_documents, embed_query
 
 load_dotenv()
 
@@ -53,13 +57,6 @@ RAPIDAPI_HOST = 'reddit3.p.rapidapi.com'
 
 REQUEST_TIMEOUT = 30
 FETCH_WORKERS = 4  # polite parallelism for the comment fetches
-
-# Persistent Chroma client: collections are written to disk so a product we've already
-# learned stays in the DB across server restarts (including Flask's debug auto-reload).
-# Without this the DB would be empty on every start and we'd re-scrape (and re-spend
-# RapidAPI requests) on each product every time. Collections are per-product.
-_CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.chroma')
-_chroma = chromadb.PersistentClient(path=_CHROMA_DIR)
 
 # Latest RapidAPI quota seen on a response, so the UI can warn before exhaustion. The free
 # tier is small (100/month). We persist the last-known value to the ApiQuota table so the
@@ -284,42 +281,49 @@ def build_chunks(product_name, on_progress=None):
 
 # ---------------------------------------------------------------- vector store
 
-def _collection_name(product_name):
+def _product_slug(product_name):
+    """Stable per-product key that groups a product's chunk rows (was the Chroma collection
+    name). e.g. "Sony WH-1000XM5" -> "talk-sony-wh-1000xm5"."""
     slug = re.sub(r'[^a-z0-9]+', '-', product_name.lower()).strip('-')[:50]
-    return f'talk-{slug}' or 'talk-product'
+    return f'talk-{slug}' if slug else 'talk-product'
+
+
+def _chunk_stats(slug):
+    """(count, latest ingested_at) for a product's chunks, in one query."""
+    return (
+        db.session.query(func.count(Chunk.id), func.max(Chunk.ingested_at))
+        .filter(Chunk.product_slug == slug)
+        .one()
+    )
 
 
 def _cache_status(product_name):
-    """Whether the vector DB already holds usable knowledge for this product.
+    """Whether the DB already holds usable knowledge for this product.
 
     Returns one of:
-      'fresh'   - cached and within CACHE_TTL_DAYS  -> reuse it, no scrape needed.
-      'stale'   - cached but older than the TTL      -> re-scrape to refresh.
-      'missing' - never ingested (or empty)          -> scrape for the first time.
+      'fresh'   - present and within CACHE_TTL_DAYS  -> reuse it, no scrape needed.
+      'stale'   - present but older than the TTL      -> re-scrape to refresh.
+      'missing' - never ingested (or empty)           -> scrape for the first time.
     """
-    try:
-        collection = _chroma.get_collection(_collection_name(product_name))
-    except Exception:
+    count, latest = _chunk_stats(_product_slug(product_name))
+    if not count or latest is None:
         return 'missing'
-    if collection.count() == 0:
-        return 'missing'
-    ingested_at = (collection.metadata or {}).get('ingested_at', 0)
-    age_days = (time.time() - ingested_at) / 86400
+    age_days = (datetime.utcnow() - latest).total_seconds() / 86400
     return 'fresh' if age_days <= CACHE_TTL_DAYS else 'stale'
 
 
 def ingest(product_name, on_progress=None, force=False):
     """Full pipeline: scrape -> chunk -> embed -> store. Returns chunk count.
 
-    If the product is already in the vector DB and still fresh (within CACHE_TTL_DAYS),
-    we reuse it and skip scraping entirely — this is what saves RapidAPI requests. Pass
-    force=True to re-scrape regardless of what's cached.
+    If the product is already in the DB and still fresh (within CACHE_TTL_DAYS), we reuse
+    it and skip scraping entirely — this is what saves RapidAPI requests. Pass force=True
+    to re-scrape regardless of what's cached. Needs a Flask app context (DB access).
     """
     notify = on_progress or (lambda *_: None)
+    slug = _product_slug(product_name)
 
     if not force and _cache_status(product_name) == 'fresh':
-        collection = _chroma.get_collection(_collection_name(product_name))
-        count = collection.count()
+        count, _ = _chunk_stats(slug)
         notify('cached', f'Found {count} saved Reddit opinions — no new scrape needed.')
         return count
 
@@ -331,53 +335,68 @@ def ingest(product_name, on_progress=None, force=False):
         )
 
     notify('embedding', f'Organizing {len(chunks)} opinions...')
-    name = _collection_name(product_name)
-    # Replace any prior (missing/stale) collection with a freshly-scraped one, stamping
-    # it with the ingest time so _cache_status can later judge its freshness.
-    try:
-        _chroma.delete_collection(name)
-    except Exception:
-        pass
-    collection = _chroma.create_collection(name, metadata={'ingested_at': time.time()})
-    collection.add(
-        ids=[f'c{i}' for i in range(len(chunks))],
-        documents=[c['text'] for c in chunks],
-        metadatas=[c['metadata'] for c in chunks],
-    )
+    vectors = embed_documents([c['text'] for c in chunks])
+
+    # Replace any prior (missing/stale) chunks with the freshly-scraped set, stamped with
+    # the ingest time so _cache_status can later judge freshness.
+    now = datetime.utcnow()
+    Chunk.query.filter(Chunk.product_slug == slug).delete(synchronize_session=False)
+    db.session.bulk_save_objects([
+        Chunk(
+            product_slug=slug,
+            text=c['text'],
+            source=c['metadata'].get('source', ''),
+            score=c['metadata'].get('score', 0),
+            embedding=vec,
+            ingested_at=now,
+        )
+        for c, vec in zip(chunks, vectors)
+    ])
+    db.session.commit()
     return len(chunks)
 
 
 def retrieve(product_name, question):
-    """Return the chunks most relevant to the question:
-    [{text, source, score}, ...]. Raises if the product was never ingested.
+    """Return the chunks most relevant to the question: [{text, source, score}, ...].
+    Raises if the product was never ingested. Needs a Flask app context (DB access).
 
-    How many chunks: TOP_K_FRACTION of the collection, floored at MIN_TOP_K and
-    capped at the total.
+    How many chunks: TOP_K_FRACTION of the product's stored chunks, floored at MIN_TOP_K
+    and capped at the total. Similarity is cosine distance (pgvector `<=>`).
     """
-    collection = _chroma.get_collection(_collection_name(product_name))
-    total = collection.count()
+    slug = _product_slug(product_name)
+    total, _ = _chunk_stats(slug)
+    if not total:
+        raise RuntimeError(f'"{product_name}" has not been ingested yet.')
+
     top_k = round(total * TOP_K_FRACTION)   # 35% of the product's chunks
     top_k = max(MIN_TOP_K, top_k)           # floor: never fewer than MIN_TOP_K
     top_k = min(top_k, total)               # cap: never more than exist
-    result = collection.query(query_texts=[question], n_results=top_k)
-    docs = result['documents'][0]
-    metas = result['metadatas'][0]
-    return [
-        {'text': d, 'source': m.get('source', ''), 'score': m.get('score', 0)}
-        for d, m in zip(docs, metas)
-    ]
+
+    qvec = embed_query(question)
+    rows = (
+        Chunk.query
+        .filter(Chunk.product_slug == slug)
+        .order_by(Chunk.embedding.cosine_distance(qvec))
+        .limit(top_k)
+        .all()
+    )
+    return [{'text': r.text, 'source': r.source or '', 'score': r.score or 0} for r in rows]
 
 
 # ---------------------------------------------------------------- CLI test
 
 if __name__ == '__main__':
-    product = ' '.join(sys.argv[1:]) or 'Samsung Galaxy S24 Ultra'
-    started = time.time()
-    count = ingest(product, on_progress=lambda stage, msg: print(f'[{stage}] {msg}'))
-    print(f'\nIngested {count} chunks in {time.time() - started:.1f}s\n')
+    # DB access needs a Flask app context; build the app and push one for the self-test.
+    from backend import create_app
 
-    for q in ('how is the battery life?', 'is the camera good in low light?'):
-        print(f'Q: {q}')
-        for hit in retrieve(product, q, top_k=3):
-            print(f'  - ({hit["score"]} pts) {hit["text"][:140]}...')
-        print()
+    product = ' '.join(sys.argv[1:]) or 'Samsung Galaxy S24 Ultra'
+    with create_app().app_context():
+        started = time.time()
+        count = ingest(product, on_progress=lambda stage, msg: print(f'[{stage}] {msg}'))
+        print(f'\nIngested {count} chunks in {time.time() - started:.1f}s\n')
+
+        for q in ('how is the battery life?', 'is the camera good in low light?'):
+            print(f'Q: {q}')
+            for hit in retrieve(product, q):
+                print(f'  - ({hit["score"]} pts) {hit["text"][:140]}...')
+            print()

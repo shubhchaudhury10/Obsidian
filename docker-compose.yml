@@ -16,13 +16,13 @@ x-app: &app
     db: { condition: service_healthy }
     redis: { condition: service_healthy }
     rabbitmq: { condition: service_healthy }
-  volumes:
-    - chroma:/app/.chroma            # shared vector store (see note below)
   restart: unless-stopped
 
 services:
   db:
-    image: postgres:18
+    # pgvector image = Postgres 18 with the `vector` extension available (CREATE EXTENSION
+    # runs in the initial migration). Vectors for the RAG feature live here now.
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -81,4 +81,3 @@ services:
 
 volumes:
   pgdata:
-  chroma:

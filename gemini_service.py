@@ -33,6 +33,54 @@ MAX_BACKOFF = 8.0  # cap per-retry sleep so a slow recovery doesn't stall the us
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# --- Embeddings (for the Reddit RAG; stored in Postgres/pgvector) ---------------
+# gemini-embedding-001 defaults to 3072 dims but supports Matryoshka truncation; we ask
+# for 768 (output_dimensionality) to match the pgvector column. task_type lets the model
+# optimize document vs. query representations (measurably better retrieval than untyped).
+EMBED_MODEL = os.environ.get('GEMINI_EMBED_MODEL', 'gemini-embedding-001')
+EMBED_DIM = 768
+_EMBED_BATCH = 100   # max contents per embed_content call we send
+
+
+def embed_documents(texts: List[str]) -> List[List[float]]:
+    """Embed chunk texts for storage (RETRIEVAL_DOCUMENT). Batched; returns one vector each."""
+    out: List[List[float]] = []
+    for i in range(0, len(texts), _EMBED_BATCH):
+        out.extend(_embed_batch(texts[i:i + _EMBED_BATCH], 'RETRIEVAL_DOCUMENT'))
+    return out
+
+
+def embed_query(text: str) -> List[float]:
+    """Embed a single search query (RETRIEVAL_QUERY)."""
+    return _embed_batch([text], 'RETRIEVAL_QUERY')[0]
+
+
+def _embed_batch(texts: List[str], task_type: str) -> List[List[float]]:
+    """One embed_content call with the same transient-error retry policy as _generate."""
+    delay = 1.0
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.models.embed_content(
+                model=EMBED_MODEL,
+                contents=texts,
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=EMBED_DIM,
+                ),
+            )
+            return [list(e.values) for e in resp.embeddings]
+        except genai_errors.APIError as exc:
+            code = getattr(exc, 'code', None)
+            if code == 429:
+                raise RuntimeError(
+                    'Gemini embedding rate limit hit (free tier allows few requests per '
+                    'minute). Wait a minute and retry, or enable billing for higher limits.'
+                ) from exc
+            if code not in RETRYABLE_CODES or attempt == MAX_RETRIES:
+                raise
+            time.sleep(min(delay, MAX_BACKOFF) + random.uniform(0, 0.5))
+            delay *= 2
+
 
 def _generate(**kwargs):
     """Call the model, retrying transient server errors with exponential backoff.

@@ -13,8 +13,13 @@ are managed with Flask-Migrate (Alembic). The target database is chosen by DATAB
 import datetime
 
 from flask_sqlalchemy import SQLAlchemy
+from pgvector.sqlalchemy import Vector
 
 db = SQLAlchemy()
+
+# Dimension of the Gemini embedding vectors we store — gemini-embedding-001 truncated to
+# 768 via output_dimensionality (see gemini_service).
+EMBED_DIM = 768
 
 
 def _utcnow():
@@ -86,6 +91,24 @@ class IngestionJob(db.Model):
     chunk_count = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
+class Chunk(db.Model):
+    """One embedded Reddit chunk for the "Talk to your product" RAG (pgvector).
+
+    Replaces the per-product ChromaDB collection: one row per chunk, scoped by
+    product_slug and similarity-searched on `embedding` (cosine). Requires Postgres with
+    the `vector` extension. Embeddings come from Gemini gemini-embedding-001 (768-dim).
+    """
+    __tablename__ = 'chunks'
+
+    id = db.Column(db.Integer, primary_key=True)
+    product_slug = db.Column(db.String(255), nullable=False, index=True)   # groups a product's chunks
+    text = db.Column(db.Text, nullable=False)
+    source = db.Column(db.String(1000))                    # the Reddit thread URL
+    score = db.Column(db.Integer, default=0)               # Reddit upvotes (for display)
+    embedding = db.Column(Vector(EMBED_DIM), nullable=False)
+    ingested_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)  # freshness
 
 
 class ApiQuota(db.Model):

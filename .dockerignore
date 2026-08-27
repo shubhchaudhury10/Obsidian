@@ -1,0 +1,30 @@
+# Keep the build context small and secrets out of the image.
+.git
+.gitignore
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Node / frontend build (rebuilt inside the image by the frontend stage)
+storefront-ui/node_modules/
+storefront-ui/dist/
+
+# Local state that must NOT be baked into the image (comes from volumes/services)
+.chroma/
+.quota.json
+.watches.json
+obsidian.db
+instance/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+
+# Docs/tooling not needed at runtime
+migrations/versions/__pycache__/

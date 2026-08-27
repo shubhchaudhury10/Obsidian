@@ -1,0 +1,84 @@
+# Full local/deploy stack: Postgres + Redis + RabbitMQ + web (waitress) + Celery worker + beat.
+#   docker compose up --build
+# Secrets come from .env (env_file). The connection URLs below OVERRIDE the localhost ones
+# in .env so the containers reach each other by service name (db / redis / rabbitmq).
+
+# Shared config for the three app containers (same image, different command).
+x-app: &app
+  build: .
+  env_file: .env                     # GEMINI/GOOGLE/JWT/SMTP/RAPIDAPI secrets
+  environment: &app-env
+    DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/obsidian
+    REDIS_URL: redis://redis:6379/0
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672//
+    FLASK_DEBUG: "0"
+  depends_on:
+    db: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+  volumes:
+    - chroma:/app/.chroma            # shared vector store (see note below)
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: obsidian
+    volumes:
+      # Postgres 18+ stores data in a version subdir, so the mount is at
+      # /var/lib/postgresql (NOT .../data as in <=17).
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d obsidian"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "15672:15672"                # management UI (guest/guest) — handy, optional
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  web:
+    <<: *app
+    # Apply DB migrations, then serve under waitress.
+    command: sh -c "flask db upgrade && waitress-serve --listen=*:5000 wsgi:app"
+    ports:
+      - "5000:5000"
+
+  worker:
+    <<: *app
+    # On Linux the default prefork pool works (no --pool=solo needed — that was Windows).
+    command: celery -A celery_app.celery worker --loglevel=info
+    # These run no web server, so the image's :5000 healthcheck doesn't apply to them.
+    healthcheck:
+      disable: true
+
+  beat:
+    <<: *app
+    command: celery -A celery_app.celery beat --loglevel=info
+    healthcheck:
+      disable: true
+
+volumes:
+  pgdata:
+  chroma:

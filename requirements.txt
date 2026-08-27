@@ -11,5 +11,6 @@ flask-sqlalchemy>=3.1
 flask-migrate>=4.0
 psycopg2-binary>=2.9   # PostgreSQL driver (prod); SQLite needs no driver
 flask-limiter>=3.5
-redis>=5.0             # rate-limit counter store + Celery broker/backend
+redis>=5.0             # rate-limit counter store + Celery result backend
 celery>=5.3            # background task queue (ingestion, price-watch agent) + Beat scheduler
+waitress>=3.0          # production WSGI server (cross-platform: Windows dev + Linux container)

@@ -55,8 +55,10 @@ CACHE_TTL_DAYS = float(os.environ.get('CACHE_TTL_DAYS', '7'))
 RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY')
 RAPIDAPI_HOST = 'reddit3.p.rapidapi.com'
 
-REQUEST_TIMEOUT = 30
-FETCH_WORKERS = 4  # polite parallelism for the comment fetches
+REQUEST_TIMEOUT = 15   # per-call cap; a slow thread fails fast (fetch returns [] on error)
+# One parallel wave for all commented posts (== POSTS_WITH_COMMENTS) instead of two half
+# waves, so the comment phase takes ~one call's time, not two. Same number of API calls.
+FETCH_WORKERS = 8
 
 # Latest RapidAPI quota seen on a response, so the UI can warn before exhaustion. The free
 # tier is small (100/month). We persist the last-known value to the ApiQuota table so the
@@ -112,7 +114,20 @@ def _save_quota():
 
 
 def get_quota():
-    """Most recent {remaining, limit} from RapidAPI's rate-limit headers."""
+    """Most recent {remaining, limit} from RapidAPI's rate-limit headers.
+
+    Reads the shared ApiQuota row, not this process's in-memory copy: scraping runs in the
+    Celery worker but the UI asks the web process, so the DB is the only place both see. In
+    a request handler there's already an app context; outside one (standalone) we fall back
+    to the in-memory value.
+    """
+    try:
+        from models import ApiQuota
+        row = ApiQuota.query.filter_by(provider=_QUOTA_PROVIDER).first()
+        if row and row.calls_limit is not None:
+            return {'limit': row.calls_limit, 'remaining': row.calls_limit - (row.calls_used or 0)}
+    except Exception:
+        pass
     return dict(_quota)
 
 
@@ -282,9 +297,22 @@ def build_chunks(product_name, on_progress=None):
 # ---------------------------------------------------------------- vector store
 
 def _product_slug(product_name):
-    """Stable per-product key that groups a product's chunk rows (was the Chroma collection
-    name). e.g. "Sony WH-1000XM5" -> "talk-sony-wh-1000xm5"."""
-    slug = re.sub(r'[^a-z0-9]+', '-', product_name.lower()).strip('-')[:50]
+    """Canonical per-product cache key that groups a product's chunk rows.
+
+    Collapses storage/RAM/color/connectivity variants of the SAME phone to one slug, so
+    the concierge search returning the name differently each time doesn't cause redundant
+    re-scrapes. e.g. "Galaxy S25 FE 5G (8GB RAM, 128GB Storage)", "Galaxy S25 FE (128 GB,
+    Navy)" and "Galaxy S25 FE" all map to talk-samsung-galaxy-s25-fe — one scrape, reused
+    across users. "S25 FE" vs "S24 FE" vs "S25 Ultra" stay distinct (model markers kept).
+    """
+    n = product_name.lower()
+    n = n.replace('+', ' plus ')                       # keep S25+ distinct from S25
+    n = re.sub(r'\([^)]*\)', ' ', n)                   # drop "(8GB RAM, 128GB Storage)"
+    n = n.split(',')[0]                                 # drop trailing ", Navy"
+    n = re.sub(r'\b\d+\s?(gb|tb)\b', ' ', n)            # storage sizes
+    n = re.sub(r'\b(4g|5g|lte|wifi)\b', ' ', n)         # connectivity
+    n = re.sub(r'\b(smartphone|mobile|phone|with)\b', ' ', n)  # filler words
+    slug = re.sub(r'[^a-z0-9]+', '-', n).strip('-')[:50]
     return f'talk-{slug}' if slug else 'talk-product'
 
 

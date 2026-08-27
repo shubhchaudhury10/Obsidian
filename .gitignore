@@ -9,3 +9,6 @@ venv/
 .watches.json
 .chroma/
 instance/
+
+# Celery Beat local schedule DB (runtime state)
+celerybeat-schedule*

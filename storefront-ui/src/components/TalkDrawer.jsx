@@ -14,6 +14,10 @@ const SUGGESTED = [
 export default function TalkDrawer({ product, onClose, onQuota }) {
   const open = !!product
   const productName = product?.name || ''
+  // Identity for ingestion/retrieval: the concierge's canonical `model` (same across
+  // colour/storage variants) so we don't re-scrape the same phone. Falls back to the
+  // display name if an older result has no model. Display still uses productName.
+  const productKey = product?.model || product?.name || ''
 
   const [phase, setPhase] = useState('idle')   // idle | preparing | ready | error
   const [statusMsg, setStatusMsg] = useState('')
@@ -45,12 +49,12 @@ export default function TalkDrawer({ product, onClose, onQuota }) {
     fetch('/talk/prepare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ product: productName }),
+      body: JSON.stringify({ product: productKey }),
     }).catch(() => {})
 
     const poll = async () => {
       try {
-        const res = await fetch(`/talk/status?product=${encodeURIComponent(productName)}`)
+        const res = await fetch(`/talk/status?product=${encodeURIComponent(productKey)}`)
         const data = await res.json()
         if (cancelled) return
         if (data.quota) reportQuota(data.quota)
@@ -74,7 +78,7 @@ export default function TalkDrawer({ product, onClose, onQuota }) {
       cancelled = true
       clearInterval(pollRef.current)
     }
-  }, [open, productName])
+  }, [open, productKey])
 
   // Keep the conversation scrolled to the latest message.
   useEffect(() => {
@@ -92,7 +96,7 @@ export default function TalkDrawer({ product, onClose, onQuota }) {
       const res = await fetch('/talk/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ product: productName, question: q, history }),
+        body: JSON.stringify({ product: productKey, question: q, history }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Request failed')

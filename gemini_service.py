@@ -136,7 +136,12 @@ User description:
 Return ONLY a valid JSON array of exactly 6 products in this exact structure:
 [
   {{
-    "name": "Exact product name (include brand and model)",
+    "name": "Exact product name as listed (brand, model, and variant as shown)",
+    "model": "Canonical model identity ONLY: brand + model + tier. Drop colour, storage,
+              RAM, connectivity, and marketing words. Examples: 'OnePlus Nord 6 5G',
+              'Samsung Galaxy S25 FE', 'Sony WH-1000XM5'. CRITICAL: the same product in a
+              different colour/storage/RAM MUST get the EXACT SAME model value, so it can
+              be de-duplicated.",
     "price": "Price found via search, or empty string if unavailable",
     "description": "A short one-sentence summary of the product",
     "source": "Retailer/site name, e.g. Amazon, Flipkart"

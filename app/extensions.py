@@ -30,8 +30,16 @@ def _rate_key():
 
 
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-# Counters live in Redis (REDIS_URL) — a real Redis is required; no in-memory fallback.
-limiter = Limiter(key_func=_rate_key, storage_uri=REDIS_URL, strategy='fixed-window')
+# Counters live in Redis (REDIS_URL). swallow_errors=True makes rate limiting FAIL OPEN:
+# if Redis is unreachable, the request is allowed through (and Flask-Limiter logs the
+# error) instead of 500-ing. Availability over strict enforcement — a Redis blip
+# shouldn't take the API down; the exposure window is small since Redis auto-restarts.
+limiter = Limiter(
+    key_func=_rate_key,
+    storage_uri=REDIS_URL,
+    strategy='fixed-window',
+    swallow_errors=True,
+)
 
 
 # --- "Talk to your product" ingestion job helpers ------------------------------

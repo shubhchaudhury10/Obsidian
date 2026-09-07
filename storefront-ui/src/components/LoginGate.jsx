@@ -6,7 +6,7 @@ export default function LoginGate({ onSignIn }) {
       <div className="login-card">
         <span className="brand">
           <span className="brand-dot" />
-          OBSIDIAN
+          TALKPROD
         </span>
         <h1 className="login-title">Your AI shopping concierge</h1>
         <p className="login-sub">

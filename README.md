@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🖤 Obsidian
+# 🖤 TalkProd
 
 **An AI shopping storefront for the Indian market — search grounded in Google, answers grounded in Reddit, and an agent that watches prices while you sleep.**
 
@@ -12,7 +12,7 @@ Flask · React + Vite · Postgres/pgvector · Celery · Gemini · LangChain
 
 ## What it is
 
-Obsidian (repo: `TalkProd-Chatbot`) is a full-stack shopping assistant for Amazon.in / Flipkart shoppers. It is built around three ideas that most "AI storefronts" skip:
+TalkProd is a full-stack shopping assistant for Amazon.in / Flipkart shoppers. It is built around three ideas that most "AI storefronts" skip:
 
 | | Feature | The idea |
 |---|---|---|

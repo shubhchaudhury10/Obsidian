@@ -18,7 +18,7 @@ export default function Navbar({ quota, user, onSignIn, onSignOut, onOpenWatches
       <div className="wrap nav-inner">
         <a href="#top" className="brand">
           <span className="brand-dot" />
-          OBSIDIAN
+          TALKPROD
         </a>
 
         <div className="nav-right">
